@@ -3,15 +3,18 @@ import json
 import uuid
 import re
 import threading
+import platform
+import subprocess
+import queue
 from queue import Queue
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton,
     QComboBox, QTreeWidget, QTreeWidgetItem, QHeaderView, QFileDialog, QMessageBox,
-    QPlainTextEdit, QSpinBox, QDoubleSpinBox, QAbstractSpinBox, QFormLayout, QFrame,
-    QProgressBar
+    QPlainTextEdit, QFormLayout, QFrame, QProgressBar, QMenu
 )
-from PySide6.QtCore import Qt, QObject, Signal, QTimer, QSize
+from PySide6.QtCore import Qt, QObject, Signal, QSize, QUrl
+from PySide6.QtGui import QDesktopServices
 
 class DownloadSignals(QObject):
     """Сигналы для общения фонового потока загрузки с главным UI потоком"""
@@ -120,7 +123,9 @@ class MainWindow(QWidget):
         self.task_items = {} # task_id -> QTreeWidgetItem
         self.task_data_map = {} # task_id -> task_data
         self.is_paused = False
-        self.active_downloaders = set()
+        self.active_downloaders = {} # task_id -> downloader
+        self.cancelled_tasks = set() # task_id -> bool
+        self.is_stopped = False
         
         # Настройки по умолчанию
         self.settings_file = os.path.expanduser('~/.universal_comic_downloader.json')
@@ -135,9 +140,12 @@ class MainWindow(QWidget):
         }
         self.load_settings()
         
-        # Запуск фоновых потоков загрузчиков (10 потоков, но работа ограничивается worker_cond)
-        for _ in range(10):
-            threading.Thread(target=self._worker_thread, daemon=True).start()
+        # Запуск фоновых потоков загрузчиков по количеству max_comics
+        self.worker_threads = []
+        for _ in range(self.settings.get('max_comics', 3)):
+            t = threading.Thread(target=self._worker_thread, daemon=True)
+            t.start()
+            self.worker_threads.append(t)
             
         
         # Настройка сигналов
@@ -464,9 +472,19 @@ class MainWindow(QWidget):
         self.settings['rate_limit_delay'] = delay
         self.save_settings()
         
+        # Убеждаемся, что потоков достаточно
+        current_threads = len([t for t in getattr(self, 'worker_threads', []) if t.is_alive()])
+        if comics > current_threads:
+            if not hasattr(self, 'worker_threads'):
+                self.worker_threads = []
+            for _ in range(comics - current_threads):
+                t = threading.Thread(target=self._worker_thread, daemon=True)
+                t.start()
+                self.worker_threads.append(t)
+
         # Динамически обновляем параметры у текущих активных загрузок
         with self.download_lock:
-            for d in self.active_downloaders:
+            for d in self.active_downloaders.values():
                 d.max_workers = images
                 d.rate_limit_delay = delay
         
@@ -512,20 +530,21 @@ class MainWindow(QWidget):
             self.btn_pause.setText("Продолжить")
             self.btn_pause.setIcon(self.ThemeManager.make_icon("play", text_color))
             with self.download_lock:
-                for d in self.active_downloaders:
+                for d in self.active_downloaders.values():
                     d.pause()
             self.lbl_status.setText("Загрузка приостановлена")
         else:
             self.btn_pause.setText("Пауза")
             self.btn_pause.setIcon(self.ThemeManager.make_icon("pause", text_color))
             with self.download_lock:
-                for d in self.active_downloaders:
+                for d in self.active_downloaders.values():
                     d.resume()
             self.lbl_status.setText("Загрузка возобновлена")
 
     def stop_all_downloads(self):
         # 1. Очистить очередь ожидания
         with self.download_lock:
+            self.is_stopped = True
             while not self.download_queue.empty():
                 try:
                     item = self.download_queue.get_nowait()
@@ -541,7 +560,7 @@ class MainWindow(QWidget):
                     
         # 2. Отменить активные загрузки
         with self.download_lock:
-            for d in self.active_downloaders:
+            for d in self.active_downloaders.values():
                 d.cancel()
         
         # 3. Снять паузу, если была (чтобы потоки могли завершиться)
@@ -549,6 +568,25 @@ class MainWindow(QWidget):
             self.toggle_pause()
             
         self.lbl_status.setText("Загрузка отменена. Потоки скоро завершатся.")
+
+    def closeEvent(self, event):
+        """Корректное завершение при закрытии окна: отменяем активные загрузки
+        и снимаем паузу, чтобы их потоки успели закрыть сессии и удалить
+        временные папки (а не были убиты резко вместе с процессом)."""
+        self.is_stopped = True
+        with self.download_lock:
+            # Очистить очередь ожидания
+            while not self.download_queue.empty():
+                try:
+                    self.download_queue.get_nowait()
+                    self.download_queue.task_done()
+                except Exception:
+                    break
+            # Отменить активные загрузки и снять паузу
+            for d in self.active_downloaders.values():
+                d.cancel()
+                d.resume()
+        super().closeEvent(event)
 
     def select_output_dir(self):
         folder = QFileDialog.getExistingDirectory(self, "Выберите папку для комиксов", self.output_dir_entry.text())
@@ -589,6 +627,7 @@ class MainWindow(QWidget):
 
     def add_to_queue(self):
         text = self.url_entry.toPlainText()
+        self.is_stopped = False
         if not text.strip():
             return
             
@@ -720,23 +759,116 @@ class MainWindow(QWidget):
     def show_context_menu(self, position):
         item = self.tree.itemAt(position)
         if item:
-            from PySide6.QtWidgets import QMenu
-            from PySide6.QtGui import QDesktopServices
-            from PySide6.QtCore import QUrl
+            # Найти task_id для этого QTreeWidgetItem
+            task_id = None
+            for k, v in self.task_items.items():
+                if v == item:
+                    task_id = k
+                    break
+            
+            if not task_id:
+                return
+                
+            status = item.text(1)
+            task_data = self.task_data_map.get(task_id)
+            file_path = task_data.get('file_path') if task_data else None
             
             menu = QMenu()
+
+            
+            # Для завершенных файлов
+            if status in ["Завершено", "Частично"] and file_path and os.path.exists(file_path):
+                action_open_file = menu.addAction("Открыть файл")
+                action_show_folder = menu.addAction("Показать в папке")
+                menu.addSeparator()
+            else:
+                action_open_file = None
+                action_show_folder = None
+            
+            # Для активных / ожидающих
+            if status in ["Ожидание...", "Скачивается..."]:
+                action_cancel = menu.addAction("Отменить загрузку")
+                menu.addSeparator()
+            else:
+                action_cancel = None
+                
             action_open = menu.addAction("Открыть ссылку в браузере")
             
+            # Для завершенных, ошибочных или отмененных
+            if status not in ["Ожидание...", "Скачивается..."]:
+                action_delete = menu.addAction("Удалить из списка")
+            else:
+                action_delete = None
+                
             action = menu.exec(self.tree.viewport().mapToGlobal(position))
+            
             if action == action_open:
-                url = item.text(0)
-                QDesktopServices.openUrl(QUrl(url))
+                QDesktopServices.openUrl(QUrl(item.text(0)))
+            elif status in ["Завершено", "Частично"] and file_path and os.path.exists(file_path):
+                if action == action_open_file:
+                    self.open_file(file_path)
+                elif action == action_show_folder:
+                    self.show_in_folder(file_path)
+            elif status in ["Ожидание...", "Скачивается..."] and action == action_cancel:
+                self.cancel_task(task_id)
+                
+            if action_delete and action == action_delete:
+                self.tree.invisibleRootItem().removeChild(item)
+                self.task_items.pop(task_id, None)
+                self.task_data_map.pop(task_id, None)
+                self.update_queue_count()
+
+    def cancel_task(self, task_id):
+        """Отменить конкретную задачу"""
+        with self.download_lock:
+            self.cancelled_tasks.add(task_id)
+            if task_id in self.active_downloaders:
+                self.active_downloaders[task_id].cancel()
+            
+            # Обновить UI
+            item = self.task_items.get(task_id)
+            if item:
+                status = item.text(1)
+                if status == "Ожидание...":
+                    item.setText(1, "Отменено")
+                    item.setToolTip(1, "Загрузка отменена пользователем")
+                    item.setText(2, "0%")
+                elif status == "Скачивается...":
+                    item.setText(1, "Отмена...")
+                    item.setToolTip(1, "Отмена загрузки...")
+                    
+        self.lbl_status.setText("Запрос на отмену задачи отправлен")
+
+    def show_in_folder(self, file_path):
+        """Открыть папку и выделить файл в системном проводнике"""
+        if not file_path:
+            return
+        
+        try:
+            system = platform.system()
+            if system == "Windows":
+                subprocess.run(['explorer', '/select,', os.path.normpath(file_path)], shell=True)
+                return
+            elif system == "Darwin":
+                subprocess.run(['open', '-R', file_path])
+                return
+        except Exception as e:
+            print(f"Ошибка выделения файла в проводнике: {e}")
+            
+        # Резервный кроссплатформенный вариант: просто открыть папку
+        folder = os.path.dirname(file_path)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(folder))
+
+    def open_file(self, file_path):
+        """Открыть файл в системном просмотрщике по умолчанию"""
+        if not file_path:
+            return
+        QDesktopServices.openUrl(QUrl.fromLocalFile(file_path))
 
     # --- Фоновый поток ---
     
     def _worker_thread(self):
         """Фоновый поток для обработки очереди скачивания (работает постоянно)"""
-        import queue
         while True:
             with self.worker_cond:
                 while self.active_downloads >= self.settings.get('max_comics', 3) or self.download_queue.empty():
@@ -750,6 +882,17 @@ class MainWindow(QWidget):
                 
             task_id = task['task_id']
             url = task['url']
+            
+            # Проверяем, не была ли задача отменена или остановлена
+            with self.download_lock:
+                if task_id in self.cancelled_tasks or self.is_stopped:
+                    self.signals.finished.emit(task_id, False, "Отменено пользователем")
+                    with self.worker_cond:
+                        self.active_downloads -= 1
+                        self.worker_cond.notify_all()
+                    self.download_queue.task_done()
+                    continue
+
             downloader = None
 
             try:
@@ -765,7 +908,7 @@ class MainWindow(QWidget):
                 downloader.rate_limit_delay = self.settings['rate_limit_delay']
 
                 with self.download_lock:
-                    self.active_downloaders.add(downloader)
+                    self.active_downloaders[task_id] = downloader
                     if self.is_paused:
                         downloader.pause()
 
@@ -778,6 +921,11 @@ class MainWindow(QWidget):
                 )
 
                 if result.get('success'):
+                    file_path = result.get('file_path')
+                    with self.download_lock:
+                        if task_id in self.task_data_map:
+                            self.task_data_map[task_id]['file_path'] = file_path
+
                     if result.get('is_complete', True):
                         self.signals.finished.emit(task_id, True, "")
                     else:
@@ -791,8 +939,13 @@ class MainWindow(QWidget):
                 self.signals.finished.emit(task_id, False, str(e))
             finally:
                 if downloader is not None:
+                    downloader.close()
                     with self.download_lock:
-                        self.active_downloaders.discard(downloader)
+                        self.active_downloaders.pop(task_id, None)
+                
+                # Удаляем из списка отмененных
+                with self.download_lock:
+                    self.cancelled_tasks.discard(task_id)
 
                 with self.worker_cond:
                     self.active_downloads -= 1

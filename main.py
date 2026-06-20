@@ -11,18 +11,13 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from PySide6.QtWidgets import QApplication
-from core.downloader import UniversalComicDownloader
 from gui.main_window import MainWindow
-from gui.theme import ThemeManager
 
 
 def main():
     """Главная функция"""
     # Создать приложение Qt
     app = QApplication(sys.argv)
-    
-    # Применить современную дизайн-систему
-    ThemeManager.apply_modern_dark(app)
     
     # Создать и показать главное окно
     window = MainWindow()

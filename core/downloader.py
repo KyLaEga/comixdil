@@ -6,11 +6,12 @@ import os
 import sys
 import re
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 import subprocess
 import json
 import tempfile
 import shutil
-import gc
 from bs4 import BeautifulSoup
 from PIL import Image
 from io import BytesIO
@@ -19,20 +20,33 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 from urllib.parse import urljoin, urlparse
 
+import mmap
+import zipfile
+import img2pdf
 
 class UniversalComicDownloader:
     """Универсальный загрузчик комиксов с любых сайтов"""
-    _gallery_dl_lock = threading.Lock()
     _last_request_time = 0.0
     _rate_limit_lock = threading.Lock()
     
     def __init__(self, max_workers=3):
         self.max_workers = max_workers
         self.session = requests.Session()
+        
+        # Настройка Retry для стабильности сети
+        retry_strategy = Retry(
+            total=3,
+            backoff_factor=1,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=["HEAD", "GET", "OPTIONS"]
+        )
+        adapter = HTTPAdapter(max_retries=retry_strategy)
+        self.session.mount("https://", adapter)
+        self.session.mount("http://", adapter)
+        
         self.session.headers.update({
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
         })
-
                 
         self.lock = threading.Lock()
         self.cancelled = False
@@ -45,6 +59,11 @@ class UniversalComicDownloader:
         
         # Минимальный размер изображения (в байтах) для фильтрации рекламы/иконок
         self.min_image_size = 50 * 1024  # 50 KB
+        
+    def close(self):
+        """Корректно закрыть сессию и освободить ресурсы"""
+        if hasattr(self, 'session') and self.session:
+            self.session.close()
     
     def pause(self):
         """Поставить скачивание на паузу"""
@@ -187,13 +206,11 @@ class UniversalComicDownloader:
             return image_urls
         
         # Для generic парсера фильтруем по размеру
-        filtered = []
         headers = {'Referer': referer}
         
-        for url in image_urls:
+        def check_url(url):
             if self.cancelled:
-                break
-            
+                return None
             try:
                 # HEAD запрос для проверки размера
                 response = self.session.head(url, timeout=10, headers=headers, allow_redirects=True)
@@ -201,99 +218,100 @@ class UniversalComicDownloader:
                 # Если HEAD не работает, пробуем GET с Range
                 if response.status_code >= 400:
                     response = self.session.get(url, timeout=10, headers={**headers, 'Range': 'bytes=0-1024'}, stream=True)
+                    response.close() # Обязательно закрываем stream!
                 
                 # Проверить Content-Type
                 content_type = response.headers.get('Content-Type', '')
                 if not content_type.startswith('image/'):
-                    continue
+                    return None
                 
                 # Проверить размер
                 content_length = response.headers.get('Content-Length')
                 if content_length:
-                    size = int(content_length)
-                    if size >= self.min_image_size:
-                        filtered.append(url)
+                    if int(content_length) >= self.min_image_size:
+                        return url
+                    else:
+                        return None
                 else:
                     # Если размер неизвестен, добавить (проверим при загрузке)
-                    filtered.append(url)
-                
-                if self.cancel_event.is_set():
-                    return []  # Отмена
-                
-            except Exception as e:
+                    return url
+            except Exception:
                 # В случае ошибки добавить (проверим при загрузке)
-                filtered.append(url)
-        
+                return url
+
+        # Распараллеливаем проверку размеров
+        with ThreadPoolExecutor(max_workers=min(10, self.max_workers * 2)) as executor:
+            results = list(executor.map(check_url, image_urls))
+            
+        filtered = [url for url in results if url is not None]
         print(f"✅ После фильтрации: {len(filtered)} изображений")
         return filtered
     
     def get_gallery_dl_info(self, url, progress_callback=None):
         """Попытка получить информацию с помощью gallery-dl"""
-        with self._gallery_dl_lock:
-            if progress_callback:
-                progress_callback(0, 100, "Получение информации...")
-            try:
-                # Используем gallery-dl из venv если он есть, иначе глобальный
-                gallery_dl_cmd = os.path.join(os.path.dirname(sys.executable), "gallery-dl")
-                if not os.path.exists(gallery_dl_cmd):
-                    gallery_dl_cmd = "gallery-dl"
+        if progress_callback:
+            progress_callback(0, 100, "Получение информации...")
+        try:
+            # Используем gallery-dl из venv если он есть, иначе глобальный
+            exe_dir = os.path.dirname(sys.executable)
+            gallery_dl_cmd = os.path.join(exe_dir, "gallery-dl.exe" if os.name == 'nt' else "gallery-dl")
+            if not os.path.exists(gallery_dl_cmd):
+                gallery_dl_cmd = "gallery-dl"
+                
+            args = [gallery_dl_cmd, "-j"]
+            args.append(url)
+            
+            process = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            
+            start_time = time.time()
+            timeout_seconds = 45  # Максимальное время ожидания ответа
+            
+            stdout = ""
+            # Читаем данные через communicate с таймаутом, чтобы не переполнить pipe-буфер ОС (deadlock)
+            while True:
+                if self.cancel_event.is_set():
+                    process.kill()
+                    process.wait()
+                    return None
                     
-                args = [gallery_dl_cmd, "-j"]
-
-                        
-                args.append(url)
-                
-                process = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-                
-                start_time = time.time()
-                timeout_seconds = 45  # Максимальное время ожидания ответа
-                
-                stdout = ""
-                # Читаем данные через communicate с таймаутом, чтобы не переполнить pipe-буфер ОС (deadlock)
-                while True:
-                    if self.cancel_event.is_set():
+                try:
+                    out, err = process.communicate(timeout=0.5)
+                    stdout = out
+                    break
+                except subprocess.TimeoutExpired:
+                    if time.time() - start_time > timeout_seconds:
+                        print(f"⚠️ Ошибка: gallery-dl завис (тайм-аут {timeout_seconds}с)")
                         process.kill()
                         process.wait()
                         return None
                         
-                    try:
-                        out, err = process.communicate(timeout=0.5)
-                        stdout = out
-                        break
-                    except subprocess.TimeoutExpired:
-                        if time.time() - start_time > timeout_seconds:
-                            print(f"⚠️ Ошибка: gallery-dl завис (тайм-аут {timeout_seconds}с)")
-                            process.kill()
-                            process.wait()
-                            return None
-                            
-                if process.returncode != 0 or not stdout.strip():
-                    return None
+            if process.returncode != 0 or not stdout.strip():
+                return None
+            
+            data = json.loads(stdout)
+            if not data or not isinstance(data, list):
+                return None
                 
-                data = json.loads(stdout)
-                if not data or not isinstance(data, list):
-                    return None
-                    
-                title = None
-                image_urls = []
-                
-                for item in data:
-                    if isinstance(item, list) and len(item) >= 2:
-                        if item[0] == 2 and isinstance(item[1], dict):
-                            title = item[1].get("title")
-                        elif item[0] == 3 and isinstance(item[1], str):
-                            image_urls.append(item[1])
-                            
-                if image_urls:
-                    return {
-                        'title': title,
-                        'image_urls': image_urls,
-                        'page_count': len(image_urls),
-                        'is_archive': False
-                    }
-            except Exception as e:
-                print(f"Ошибка gallery-dl: {e}")
-            return None
+            title = None
+            image_urls = []
+            
+            for item in data:
+                if isinstance(item, list) and len(item) >= 2:
+                    if item[0] == 2 and isinstance(item[1], dict):
+                        title = item[1].get("title")
+                    elif item[0] == 3 and isinstance(item[1], str):
+                        image_urls.append(item[1])
+                        
+            if image_urls:
+                return {
+                    'title': title,
+                    'image_urls': image_urls,
+                    'page_count': len(image_urls),
+                    'is_archive': False
+                }
+        except Exception as e:
+            print(f"Ошибка gallery-dl: {e}")
+        return None
 
     def get_page_info(self, url, progress_callback=None):
         """Получить информацию о странице (универсальный метод)"""
@@ -511,28 +529,25 @@ class UniversalComicDownloader:
         results = [r for r in results if r is not None]
         return results
     
-    def save_as_pdf(self, image_paths, output_path, quality=95):
+    def save_as_pdf(self, image_paths, output_path):
         """Сохранить изображения в PDF из файлов на диске с помощью img2pdf"""
         if not image_paths:
             raise Exception("Нет изображений для сохранения")
         
         try:
-            import img2pdf
             with open(output_path, "wb") as f:
                 f.write(img2pdf.convert(image_paths))
             return os.path.getsize(output_path)
         except Exception as e:
             raise Exception(f"Ошибка создания PDF с помощью img2pdf: {e}")
     
-    def save_as_cbz(self, image_paths, output_path, quality=95):
+    def save_as_cbz(self, image_paths, output_path):
         """Сохранить изображения в CBZ из файлов на диске (без декодирования, т.к. они уже сжаты при скачивании)"""
         if not image_paths:
             raise Exception("Нет изображений для сохранения")
         
         try:
-            import zipfile
-            
-            with zipfile.ZipFile(output_path, 'w', zipfile.ZIP_DEFLATED) as cbz:
+            with zipfile.ZipFile(output_path, 'w', zipfile.ZIP_STORED) as cbz:
                 for idx, img_path in enumerate(image_paths, 1):
                     page_name = f"page_{idx:04d}.jpg"
                     cbz.write(img_path, page_name)
@@ -583,7 +598,7 @@ class UniversalComicDownloader:
                 output_path = os.path.join(output_dir, f"{base_name}.{ext}")
                 
                 if progress_callback:
-                    progress_callback(5, 100, f"Проверка архива...")
+                    progress_callback(5, 100, "Проверка архива...")
                     
                 response = self.session.get(archive_url, stream=True, timeout=30)
                 response.raise_for_status()
@@ -608,7 +623,7 @@ class UniversalComicDownloader:
                         }
                 
                 if progress_callback:
-                    progress_callback(10, 100, f"Скачивание архива...")
+                    progress_callback(10, 100, "Скачивание архива...")
                 
                 downloaded_size = 0
                 with open(output_path, 'wb') as f:
@@ -650,7 +665,6 @@ class UniversalComicDownloader:
             if os.path.exists(output_path):
                 is_complete = False
                 if format.lower() == 'cbz':
-                    import zipfile
                     try:
                         with zipfile.ZipFile(output_path, 'r') as zf:
                             if len(zf.namelist()) >= len(image_urls):
@@ -661,7 +675,6 @@ class UniversalComicDownloader:
                     # Попытка получить количество страниц PDF через regex/mmap
                     pdf_pages = None
                     try:
-                        import mmap
                         with open(output_path, 'rb') as f:
                             with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
                                 matches = re.findall(br'/Count\s+(\d+)', mm)
@@ -727,9 +740,9 @@ class UniversalComicDownloader:
                 progress_callback(80, 100, f"Создание {format.upper()}...")
             
             if format.lower() == 'pdf':
-                file_size = self.save_as_pdf(image_paths, output_path, quality)
+                file_size = self.save_as_pdf(image_paths, output_path)
             elif format.lower() == 'cbz':
-                file_size = self.save_as_cbz(image_paths, output_path, quality)
+                file_size = self.save_as_cbz(image_paths, output_path)
             else:
                 raise Exception(f"Неподдерживаемый формат: {format}")
             
@@ -758,33 +771,4 @@ class UniversalComicDownloader:
             # Гарантированная очистка временных файлов и памяти
             if temp_dir and os.path.exists(temp_dir):
                 shutil.rmtree(temp_dir, ignore_errors=True)
-            gc.collect()
     
-    def _get_unique_filename(self, output_dir, base_name, ext):
-        """Возвращает уникальный путь к файлу, добавляя номер при конфликте"""
-        filename = f"{base_name}.{ext}"
-        output_path = os.path.join(output_dir, filename)
-        if os.path.exists(output_path):
-            counter = 1
-            while True:
-                filename = f"{base_name}_{counter}.{ext}"
-                output_path = os.path.join(output_dir, filename)
-                if not os.path.exists(output_path):
-                    break
-                counter += 1
-        return output_path
-
-    def get_cover_image(self, url):
-        """Получить обложку (первое изображение) для предпросмотра"""
-        try:
-            info = self.get_page_info(url)
-            if info.get('image_urls'):
-                return self.download_image(info['image_urls'][0], referer=url)
-            return None
-        except Exception as e:
-            print(f"Ошибка получения обложки: {e}")
-            return None
-
-
-# Алиас для обратной совместимости
-TelegraphDownloader = UniversalComicDownloader
