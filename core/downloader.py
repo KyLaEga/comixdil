@@ -33,11 +33,16 @@ class UniversalComicDownloader:
         self.max_workers = max_workers
         self.session = requests.Session()
         
-        # Настройка Retry для стабильности сети
+        # Retry только на уровне соединения/чтения (транзиентные сетевые сбои).
+        # HTTP-статусы (429/5xx) намеренно НЕ ретраим здесь: их обрабатывает цикл
+        # в download_image — он прерывается по cancel_event и согласован с rate-limit,
+        # тогда как backoff внутри urllib3 блокирует поток и не реагирует на отмену.
         retry_strategy = Retry(
-            total=3,
-            backoff_factor=1,
-            status_forcelist=[429, 500, 502, 503, 504],
+            total=2,
+            connect=2,
+            read=2,
+            backoff_factor=0.5,
+            status_forcelist=[],
             allowed_methods=["HEAD", "GET", "OPTIONS"]
         )
         adapter = HTTPAdapter(max_retries=retry_strategy)
@@ -77,12 +82,7 @@ class UniversalComicDownloader:
         """Отменить загрузку"""
         self.cancelled = True
         self.cancel_event.set()
-    
-    def reset_cancel(self):
-        """Сбросить флаг отмены"""
-        self.cancelled = False
-        self.cancel_event.clear()
-    
+
     def sanitize_filename(self, filename):
         """Очистить имя файла"""
         filename = re.sub(r'[<>:"/\\|?*]', '_', filename)
@@ -261,7 +261,7 @@ class UniversalComicDownloader:
             args = [gallery_dl_cmd, "-j"]
             args.append(url)
             
-            process = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            process = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding='utf-8')
             
             start_time = time.time()
             timeout_seconds = 45  # Максимальное время ожидания ответа
