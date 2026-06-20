@@ -1,0 +1,59 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+venv_build/
+ENV/
+env/
+.venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon
+._*
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Application
+*.db
+test_downloads/
+.deps_installed
+
+# Dev/test artifacts (debug dumps, not part of the app)
+hitomi_test.json
+page_source.html
+
+# Build artifacts
+*.spec.bak
