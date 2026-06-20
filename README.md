@@ -1,159 +1,84 @@
-# 📚 Universal Comic Downloader
+# 📚 comixdil
 
-A powerful GUI application for downloading comics from various websites and converting between PDF and CBZ formats.
+A lightweight desktop app for downloading comics & manga from almost any website and packing them into **PDF** or **CBZ**.
 
-![Version](https://img.shields.io/badge/version-2.7.0-blue)
+![Version](https://img.shields.io/badge/version-1.0.0-blue)
 ![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Windows%20%7C%20Linux-lightgrey)
 ![Python](https://img.shields.io/badge/python-3.11+-green)
 ![License](https://img.shields.io/badge/license-MIT-orange)
 
-> ⚠️ **Note**: The application interface is in **Russian**. However, the icons and layout are intuitive, making it easy to use regardless of language.
+> ⚠️ **Note**: The interface is in **Russian**, but the layout and icons are intuitive and easy to use regardless of language.
 
 ---
 
 ## ✨ Features
 
-- 🌐 **Universal Parser** - Download comics from any website (Telegraph, SexKomix2, and more)
-- 🔄 **Format Converter** - Convert between PDF and CBZ formats
-- 📚 **Library Management** - Organize your comic collection with search and filters
-- 👁️ **Built-in Viewer** - Preview comics directly in the app
-- ⌨️ **Keyboard Shortcuts** - Full keyboard support (Ctrl/Cmd+C, V, A, Delete)
-- 🎨 **Modern UI** - Clean, monochrome design
+- 🌐 **Universal downloader** — powered by [`gallery-dl`](https://github.com/mikf/gallery-dl) with built-in fallback parsers for `telegra.ph`, SexKomix and any page that contains comic images
+- 📦 **PDF & CBZ export** — assemble pages into a PDF (`img2pdf`) or a CBZ archive, with adjustable JPEG quality
+- 🧠 **RAM-friendly** — pages are streamed to a temp folder on disk instead of being kept in memory, so large galleries don't eat your RAM
+- 🧵 **Multithreaded + rate limiting** — parallel downloads with a configurable delay and automatic back-off on `503` errors
+- ⏯️ **Queue control** — add many links at once, pause/resume, cancel, and clear finished tasks
+- 🎨 **Themes** — dark, light and system, built on a modern PySide6 UI
 
 ---
 
 ## 🚀 Quick Start
 
-### macOS
-
 ```bash
-# Extract
-tar -xzf universal_comic_downloader_v2.7.0.tar.gz
-cd telegraph_comic_downloader_gui
+git clone https://github.com/KyLaEga/comixdil.git
+cd comixdil
 
-# Option 1: Run directly
-./launch_macos.command
-
-# Option 2: Create .app bundle
-./create_simple_app.sh
-cp -r "dist/Universal Comic Downloader.app" /Applications/
+pip install -r requirements.txt
+python main.py
 ```
 
-### Windows
-
-```batch
-cd telegraph_comic_downloader_gui
-launch_windows.bat
-
-:: Or build .exe
-build_windows_exe.bat
-```
-
-### Linux
-
-```bash
-cd telegraph_comic_downloader_gui
-./launch_linux.sh
-
-# Or build AppImage
-./build_linux_appimage.sh
-```
+Requires **Python 3.11+**. Dependencies (`requests`, `beautifulsoup4`, `Pillow`, `PySide6`, `gallery-dl`, `img2pdf`) are installed from `requirements.txt`.
 
 ---
 
-## 📋 Requirements
+## 📋 Usage
 
-- **Python 3.11+**
-- **Tkinter** (usually included with Python)
-- **Dependencies** (installed automatically):
-  - requests
-  - beautifulsoup4
-  - Pillow
-  - pdf2image (for PDF→CBZ conversion)
+1. Paste one or more links into the input box (**one per line**).
+2. Pick the format (**PDF** or **CBZ**) and the output folder in the sidebar.
+3. Click **«Скачать»** (Download) — the app finds the images and assembles the file.
 
-### Additional for PDF conversion:
-
-| Platform | Command |
-|----------|---------|
-| **macOS** | `brew install poppler` |
-| **Linux** | `sudo apt install poppler-utils` |
-| **Windows** | Download [Poppler](https://github.com/oschwartz10612/poppler-windows/releases) |
+**Tip:** tune *Комиксов* (parallel comics), *Потоков* (threads per comic) and *Задержка* (request delay) in the sidebar. Higher load = faster, but raises the risk of `503` blocks. Select queue items and press `Delete` to remove them.
 
 ---
 
-## 🎮 Keyboard Shortcuts
+## 🌐 Supported sites
 
-| Shortcut | Action |
-|----------|--------|
-| `Ctrl/Cmd + V` | Paste URL |
-| `Ctrl/Cmd + C` | Copy |
-| `Ctrl/Cmd + A` | Select All |
-| `Delete` | Remove selected |
-| `Enter` | Add to queue |
+- ✅ Telegraph (`telegra.ph`)
+- ✅ SexKomix and similar galleries
+- ✅ Everything `gallery-dl` supports (Hitomi, nHentai, and many more)
+- ✅ Generic fallback — any page with comic images
 
 ---
 
-## 🌐 Supported Websites
-
-- ✅ Telegraph (telegra.ph)
-- ✅ SexKomix2 (sexkomix2.com)
-- ✅ Any website with comic images (universal parser)
-
----
-
-## 📁 Project Structure
+## 📁 Project structure
 
 ```
-telegraph_comic_downloader_gui/
-├── main.py                 # Entry point
+comixdil/
+├── main.py              # Entry point (Qt app bootstrap)
 ├── core/
-│   ├── downloader.py       # Universal image parser
-│   ├── converter.py        # PDF ↔ CBZ converter
-│   └── database.py         # SQLite library
+│   └── downloader.py    # Universal downloader: parsers, fetching, PDF/CBZ export
 ├── gui/
-│   ├── main_window.py      # Main application window
-│   ├── converter_dialog.py # Converter dialog
-│   └── comic_viewer.py     # Built-in viewer
-└── utils/
-    └── helpers.py          # Utility functions
+│   ├── main_window.py   # Main window, settings sidebar, download queue
+│   └── theme.py         # Theme manager (dark / light / system) + icons
+└── requirements.txt
 ```
-
----
-
-## 🔧 Building Standalone Apps
-
-| Platform | Command | Output |
-|----------|---------|--------|
-| **macOS** | `./create_simple_app.sh` | `.app` bundle |
-| **macOS** | `./build_macos_app.sh` | Standalone `.app` |
-| **Windows** | `build_windows_exe.bat` | `.exe` file |
-| **Linux** | `./build_linux_appimage.sh` | `.AppImage` |
 
 ---
 
 ## 📖 Documentation
 
-- [README (Russian)](README_RU.md) - Подробная документация на русском
-- [Keyboard Shortcuts](KEYBOARD_SHORTCUTS.md)
-- [macOS Build Guide](BUILD_MACOS_APP.md)
-- [Windows Build Guide](WINDOWS_BUILD_GUIDE.md)
-- [Linux Build Guide](LINUX_BUILD_GUIDE.md)
-
----
-
-## 🤝 Contributing
-
-Contributions are welcome! Feel free to:
-- Report bugs
-- Suggest features
-- Submit pull requests
-- Add translations
+- [README (Russian)](README_RU.md) — документация на русском
 
 ---
 
 ## 📄 License
 
-MIT License - feel free to use, modify, and distribute.
+MIT License — feel free to use, modify, and distribute.
 
 ---
 
